@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'dart:async';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -36,11 +37,16 @@ class _GamepadScreenState extends State<GamepadScreen> {
   bool _isConnected = false;
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _targetCharacteristic;
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
 
-  final Guid _serviceUuid =
-      Guid('4faf59a6-976e-67a2-c044-869700000000');
-  final Guid _characteristicUuid =
-      Guid('a0329f59-700a-ae2e-5a3d-030600000000');
+  final Guid _serviceUuid = Guid('4faf59a6-976e-67a2-c044-869700000000');
+  final Guid _characteristicUuid = Guid('a0329f59-700a-ae2e-5a3d-030600000000');
+
+  @override
+  void dispose() {
+    _scanSubscription?.cancel();
+    super.dispose();
+  }
 
   Future<void> _connectToDevice() async {
     setState(() {
@@ -50,71 +56,51 @@ class _GamepadScreenState extends State<GamepadScreen> {
     print('====================================');
     print('偵錯開始: 嘗試連接藍牙裝置...');
     
-    // 在開始掃描前，先請求所需的藍牙權限
-    final status = await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-    ].request();
+    // 檢查並請求所有必要的藍牙權限
+    final bluetoothScanStatus = await Permission.bluetoothScan.request();
+    final bluetoothConnectStatus = await Permission.bluetoothConnect.request();
+    print('偵錯: 藍牙掃描權限狀態: $bluetoothScanStatus');
+    print('偵錯: 藍牙連線權限狀態: $bluetoothConnectStatus');
 
-    if (status[Permission.bluetoothScan] != PermissionStatus.granted ||
-        status[Permission.bluetoothConnect] != PermissionStatus.granted) {
+    if (bluetoothScanStatus.isGranted && bluetoothConnectStatus.isGranted) {
+      print('偵錯: 所有必要的藍牙權限都已授予。');
+    } else {
       print('偵錯: 藍牙權限被拒絕。無法繼續。');
       return;
     }
-    
-    // 檢查藍牙狀態
+
     final adapterState = await FlutterBluePlus.adapterState.first;
     if (adapterState != BluetoothAdapterState.on) {
       print('偵錯: 藍牙配接器未開啟，目前狀態為：$adapterState');
       return;
     }
-    
-    bool connectionSuccessful = false;
-    const int maxRetries = 3;
-    
-    for (int retryAttempt = 1; retryAttempt <= maxRetries; retryAttempt++) {
-      print('偵錯: 正在進行第 $retryAttempt 次掃描...');
-      try {
-        await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
-        print('偵錯: 掃描完成。');
 
-        final scanResults = FlutterBluePlus.lastScanResults;
-        print('偵錯: 掃描到 ${scanResults.length} 個裝置。');
-        BluetoothDevice? targetDevice;
-        for (var result in scanResults) {
+    try {
+      // 訂閱掃描結果串流
+      _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
+        print('偵錯: 掃描到 ${results.length} 個裝置。');
+        for (var result in results) {
           if (result.advertisementData.serviceUuids.contains(_serviceUuid)) {
-            targetDevice = result.device;
-            print('偵錯: 找到目標裝置 - 名稱: ${targetDevice.platformName}, ID: ${targetDevice.remoteId}');
-            break;
+            print('偵錯: 找到目標裝置 - 名稱: ${result.device.platformName}, ID: ${result.device.remoteId}');
+            
+            await FlutterBluePlus.stopScan();
+            _scanSubscription?.cancel();
+            await _connectAndDiscover(result.device);
+            return;
           }
         }
+      });
 
-        if (targetDevice != null) {
-          await _connectAndDiscover(targetDevice);
-          connectionSuccessful = true;
-          break; // 連線成功，跳出重試迴圈
-        } else {
-          print('偵錯: 掃描期間未找到目標裝置。');
-        }
-      } catch (e) {
-        print('偵錯: 連線過程中發生錯誤: $e');
-      } finally {
-        print('偵錯: 停止掃描。');
-        FlutterBluePlus.stopScan();
-      }
-
-      if (!connectionSuccessful && retryAttempt < maxRetries) {
-        print('偵錯: 等待 3 秒後重試...');
-        await Future.delayed(const Duration(seconds: 3));
-      }
+      print('偵錯: 開始持續掃描...');
+      await FlutterBluePlus.startScan(
+        withServices: [_serviceUuid],
+        timeout: null,
+      );
+      
+    } catch (e) {
+      print('偵錯: 連線過程中發生錯誤: $e');
+      _scanSubscription?.cancel();
     }
-    
-    if (connectionSuccessful) {
-      print('偵錯結束: 連線成功！');
-    } else {
-      print('偵錯結束: 嘗試 $maxRetries 次後仍無法連線。');
-    }
-    print('====================================');
   }
 
   Future<void> _connectAndDiscover(BluetoothDevice device) async {
@@ -156,8 +142,7 @@ class _GamepadScreenState extends State<GamepadScreen> {
   Future<void> _sendData(String data) async {
     if (_isConnected && _targetCharacteristic != null) {
       try {
-        await _targetCharacteristic!
-            .write(data.codeUnits, withoutResponse: false);
+        await _targetCharacteristic!.write(data.codeUnits, withoutResponse: false);
         print('資料發送成功: $data');
       } catch (e) {
         print('資料發送失敗: $e');
