@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:permission_handler/permission_handler.dart'; // 導入權限處理套件
+import 'package:permission_handler/permission_handler.dart';
+import 'dart:async'; // 導入異步庫
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  // 將螢幕方向鎖定為橫向
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
@@ -26,7 +26,6 @@ class MyApp extends StatelessWidget {
   }
 }
 
-// 將 GamepadScreen 轉換為 StatefulWidget 以管理藍芽連線狀態
 class GamepadScreen extends StatefulWidget {
   const GamepadScreen({Key? key}) : super(key: key);
 
@@ -35,18 +34,20 @@ class GamepadScreen extends StatefulWidget {
 }
 
 class _GamepadScreenState extends State<GamepadScreen> {
-  // 藍芽相關變數
   bool _isConnected = false;
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _targetCharacteristic;
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
 
-  // 定義藍芽服務和特徵 UUID
-  final Guid _serviceUuid =
-      Guid('4faf59a6-976e-67a2-c044-869700000000');
-  final Guid _characteristicUuid =
-      Guid('a0329f59-700a-ae2e-5a3d-030600000000');
+  final Guid _serviceUuid = Guid('4faf59a6-976e-67a2-c044-869700000000');
+  final Guid _characteristicUuid = Guid('a0329f59-700a-ae2e-5a3d-030600000000');
 
-  // 嘗試連接到藍芽裝置
+  @override
+  void dispose() {
+    _scanSubscription?.cancel();
+    super.dispose();
+  }
+
   Future<void> _connectToDevice() async {
     setState(() {
       _isConnected = false;
@@ -55,7 +56,6 @@ class _GamepadScreenState extends State<GamepadScreen> {
     print('====================================');
     print('偵錯開始: 嘗試連接藍牙裝置...');
     try {
-      // 在開始掃描前，先請求所需的藍牙權限
       final status = await [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
@@ -67,84 +67,72 @@ class _GamepadScreenState extends State<GamepadScreen> {
         return;
       }
       
-      // 檢查藍牙狀態
       final adapterState = await FlutterBluePlus.adapterState.first;
       if (adapterState != BluetoothAdapterState.on) {
         print('偵錯: 藍牙配接器未開啟，目前狀態為：$adapterState');
         return;
       }
       
-      // 掃描裝置
-      print('偵錯: 開始掃描裝置...');
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
-      print('偵錯: 掃描完成。');
-
-      // 尋找目標裝置
-      final scanResults = FlutterBluePlus.lastScanResults;
-      print('偵錯: 掃描到 ${scanResults.length} 個裝置。');
-      BluetoothDevice? targetDevice;
-      for (var result in scanResults) {
-        // 根據廣播的服務UUID來尋找目標裝置
-        if (result.advertisementData.serviceUuids.contains(_serviceUuid)) {
-          targetDevice = result.device;
-          print('偵錯: 找到目標裝置 - 名稱: ${targetDevice.platformName}, ID: ${targetDevice.remoteId}');
-          break;
-        }
-      }
-
-      if (targetDevice != null) {
-        // 連接到裝置
-        print('偵錯: 正在連線到裝置 ID: ${targetDevice.remoteId}...');
-        await targetDevice.connect();
-        _connectedDevice = targetDevice;
-        print('偵錯: 連線成功！');
-
-        // 發現服務和特徵
-        print('偵錯: 正在發現服務...');
-        final services = await _connectedDevice!.discoverServices();
-        print('偵錯: 發現了 ${services.length} 個服務。');
-        for (var service in services) {
-          print('偵錯: 檢查服務 UUID: ${service.uuid}');
-          if (service.uuid == _serviceUuid) {
-            print('偵錯: 找到目標服務 UUID: $_serviceUuid');
-            for (var characteristic in service.characteristics) {
-              print('偵錯: 檢查特徵 UUID: ${characteristic.uuid}');
-              if (characteristic.uuid == _characteristicUuid) {
-                _targetCharacteristic = characteristic;
-                print('偵錯: 找到目標特徵 UUID: $_characteristicUuid');
-                break;
-              }
-            }
+      print('偵錯: 開始持續掃描裝置...');
+      
+      // 移除 timeout，並監聽掃描結果
+      _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+        for (var result in results) {
+          if (result.advertisementData.serviceUuids.contains(_serviceUuid)) {
+            print('偵錯: 找到目標裝置 - 名稱: ${result.device.platformName}, ID: ${result.device.remoteId}');
+            // 找到裝置後，停止掃描並連線
+            FlutterBluePlus.stopScan();
+            _connectAndDiscover(result.device);
+            _scanSubscription?.cancel();
+            break;
           }
         }
+      });
+      
+      await FlutterBluePlus.startScan();
+      print('偵錯: 掃描啟動完成...');
 
-        if (_targetCharacteristic != null) {
-          setState(() {
-            _isConnected = true;
-          });
-          print('偵錯: 藍牙連線已完全建立。');
-        } else {
-          print('偵錯: 找不到所需的特徵。可能是 UUID 不正確或權限問題。');
-          _connectedDevice!.disconnect();
-        }
-      } else {
-        print('偵錯: 掃描期間未找到目標裝置。請確認裝置已開啟並可被發現。');
-      }
     } catch (e) {
       print('偵錯: 連線過程中發生錯誤: $e');
-      if (_connectedDevice != null) {
-        print('偵錯: 正在斷開已連線裝置的連線。');
-        _connectedDevice!.disconnect();
-      }
-    } finally {
-      print('偵錯: 停止掃描。');
-      FlutterBluePlus.stopScan();
-      print('偵錯結束: 完成連線嘗試。');
-      print('====================================');
     }
   }
 
-  // 發送字串資料到藍芽裝置
+  Future<void> _connectAndDiscover(BluetoothDevice device) async {
+    try {
+      await device.connect();
+      _connectedDevice = device;
+      print('偵錯: 連線成功！');
+
+      final services = await _connectedDevice!.discoverServices();
+      for (var service in services) {
+        if (service.uuid == _serviceUuid) {
+          for (var characteristic in service.characteristics) {
+            if (characteristic.uuid == _characteristicUuid) {
+              _targetCharacteristic = characteristic;
+              print('偵錯: 找到目標服務和特徵。');
+              break;
+            }
+          }
+        }
+      }
+
+      if (_targetCharacteristic != null) {
+        setState(() {
+          _isConnected = true;
+        });
+        print('偵錯: 藍牙連線已完全建立。');
+      } else {
+        print('偵錯: 找不到所需的特徵。');
+        _connectedDevice!.disconnect();
+      }
+    } catch (e) {
+      print('偵錯: 連線或發現服務過程中發生錯誤: $e');
+      if (_connectedDevice != null) {
+        _connectedDevice!.disconnect();
+      }
+    }
+  }
+
   Future<void> _sendData(String data) async {
     if (_isConnected && _targetCharacteristic != null) {
       try {
@@ -166,7 +154,6 @@ class _GamepadScreenState extends State<GamepadScreen> {
       body: SafeArea(
         child: Stack(
           children: <Widget>[
-            // 主要的遊戲手把介面
             GamepadInterface(
               onDpadLeft: () => _sendData('1'),
               onDpadDown: () => _sendData('3'),
@@ -174,22 +161,18 @@ class _GamepadScreenState extends State<GamepadScreen> {
               onButtonA: () => _sendData('4'),
               onButtonB: () => _sendData('5'),
             ),
-
-            // 位於上方的 Logo，並水平置中
             Positioned(
               top: 10,
               left: 0,
               right: 0,
               child: Center(
                 child: Image.asset(
-                  'assets/images/logo.png', // 確保路徑和檔名正確
+                  'assets/images/logo.png',
                   width: 301,
                   height: 158.4,
                 ),
               ),
             ),
-
-            // 位於畫面正中間的藍芽連線按鈕和文字標籤
             Positioned(
               left: 0,
               right: 0,
@@ -235,6 +218,8 @@ class _GamepadScreenState extends State<GamepadScreen> {
   }
 }
 
+// 其餘的 GamepadInterface, Dpad, ActionButtons 類別保持不變
+// ... (程式碼略過)
 class GamepadInterface extends StatelessWidget {
   final VoidCallback onDpadLeft;
   final VoidCallback onDpadDown;
@@ -346,7 +331,7 @@ class ActionButtons extends StatelessWidget {
     required this.onButtonB,
     required this.onButtonX,
     required this.onButtonY,
-    }) : super(key: key);
+  }) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
