@@ -1,37 +1,54 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:async';
+import 'package:logging/logging.dart' as logging;
 
-// 將 GamepadScreen 轉換為 StatefulWidget 以管理藍芽連線狀態
+final _logger = logging.Logger('GamepadScreen');
+
+const String DEVICE_NAME = 'MyESP32';
+const String SERVICE_UUID = '4faf59a6-976e-67a2-c044-869700000000';
+const String CHARACTERISTIC_UUID = 'a0329f59-700a-ae2e-5a3d-030600000000';
+
 class GamepadScreen extends StatefulWidget {
-  const GamepadScreen({Key? key}) : super(key: key);
+  const GamepadScreen({super.key});
 
   @override
   State<GamepadScreen> createState() => _GamepadScreenState();
 }
 
 class _GamepadScreenState extends State<GamepadScreen> {
-  // flutter_reactive_ble 實例
-  final _ble = FlutterReactiveBle();
-  // 連線狀態變數
   bool _isConnected = false;
-  // 連線裝置 ID
-  String? _connectedDeviceId;
+  BluetoothDevice? _connectedDevice;
 
-  // 定義藍牙服務和特徵 UUID
-  final Uuid _serviceUuid = Uuid.parse('4faf59a6-976e-67a2-c044-869700000000');
-  final Uuid _characteristicUuid = Uuid.parse('a0329f59-700a-ae2e-5a3d-030600000000');
+  final Guid _serviceUuid = Guid(SERVICE_UUID);
+  final Guid _characteristicUuid = Guid(CHARACTERISTIC_UUID);
 
-  // 掃描和連線的訂閱變數
-  StreamSubscription<DiscoveredDevice>? _scanSubscription;
-  StreamSubscription<ConnectionStateUpdate>? _connectionSubscription;
+  BluetoothCharacteristic? _writableCharacteristic;
+
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    FlutterBluePlus.adapterState.listen((BluetoothAdapterState state) {
+      if (state != BluetoothAdapterState.on) {
+        setState(() {
+          _isConnected = false;
+          _connectedDevice = null;
+          _writableCharacteristic = null;
+        });
+        _logger.info('藍牙適配器狀態改變：$state');
+      }
+    });
+  }
 
   @override
   void dispose() {
-    _scanSubscription?.cancel();
     _connectionSubscription?.cancel();
+    _scanSubscription?.cancel();
     super.dispose();
   }
 
@@ -40,105 +57,143 @@ class _GamepadScreenState extends State<GamepadScreen> {
       _isConnected = false;
     });
 
-    print('====================================');
-    print('偵錯開始: 嘗試連接藍牙裝置...');
-    
-    // 檢查並請求所有必要的藍牙權限
+    _logger.info('偵錯開始：嘗試連線藍牙裝置...');
+
+    final bluetoothStatus = await Permission.bluetooth.request();
     final bluetoothScanStatus = await Permission.bluetoothScan.request();
     final bluetoothConnectStatus = await Permission.bluetoothConnect.request();
-    final locationStatus = await Permission.locationWhenInUse.request(); // Android 13 仍可能需要
-    
-    print('偵錯: 藍牙掃描權限狀態: $bluetoothScanStatus');
-    print('偵錯: 藍牙連線權限狀態: $bluetoothConnectStatus');
-    print('偵錯: 位置權限狀態: $locationStatus');
+    final locationStatus = await Permission.locationWhenInUse.request();
 
-    if (bluetoothScanStatus.isGranted && bluetoothConnectStatus.isGranted) {
-      print('偵錯: 所有必要的藍牙權限都已授予。');
+    if (bluetoothStatus.isGranted &&
+        bluetoothScanStatus.isGranted &&
+        bluetoothConnectStatus.isGranted &&
+        locationStatus.isGranted) {
+      _logger.info('偵錯：所有必要的藍牙權限都已授予。');
     } else {
-      print('偵錯: 藍牙權限被拒絕。無法繼續。');
+      _logger.severe('偵錯：藍牙權限被拒絕。無法繼續。');
+      return;
+    }
+
+    if (!await FlutterBluePlus.isSupported) {
+      _logger.severe('偵錯：此裝置不支援藍牙。');
+      return;
+    }
+    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+      _logger.warning('偵錯：藍牙未開啟，正在請求開啟...');
       return;
     }
 
     try {
-      _scanSubscription = _ble.scanForDevices(
-        withServices: [_serviceUuid],
-        scanMode: ScanMode.lowLatency,
-      ).listen((device) async {
-        if (device.serviceUuids.contains(_serviceUuid)) {
-          print('偵錯: 找到目標裝置 - 名稱: ${device.name}, ID: ${device.id}');
-          
-          _scanSubscription?.cancel();
-          await _connectAndDiscover(device.id);
-        }
-      }, onError: (Object error) {
-        print('偵錯: 藍牙掃描發生錯誤: $error');
-      });
+      _logger.info('偵錯：開始掃描裝置...');
+      await FlutterBluePlus.startScan(
+        withNames: [DEVICE_NAME], // 改為使用裝置名稱來掃描
+        timeout: const Duration(seconds: 15),
+      );
 
-      print('偵錯: 開始持續掃描...');
+      _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
+        for (var result in results) {
+          if (result.device.advName == DEVICE_NAME) {
+            _logger.info('偵錯：找到目標裝置 - 名稱：${result.device.advName}, ID：${result.device.remoteId}');
+            await FlutterBluePlus.stopScan();
+            await _connectAndDiscover(result.device);
+            return;
+          }
+        }
+      });
     } catch (e) {
-      print('偵錯: 連線過程中發生錯誤: $e');
+      _logger.severe('偵錯：連線過程中發生錯誤：$e');
     }
   }
 
-  Future<void> _connectAndDiscover(String deviceId) async {
-    _connectionSubscription = _ble.connectToDevice(
-      id: deviceId,
-    ).listen((update) async {
-      print('偵錯: 連線狀態更新: ${update.connectionState}');
-      if (update.connectionState == DeviceConnectionState.connected) {
-        _connectedDeviceId = deviceId;
-        setState(() {
-          _isConnected = true;
-        });
-        print('偵錯: 連線成功！正在尋找服務...');
-      } else if (update.connectionState == DeviceConnectionState.disconnected) {
-        setState(() {
-          _isConnected = false;
-        });
-        _connectedDeviceId = null;
-        print('偵錯: 裝置已斷線。');
-      }
+  Future<void> _connectAndDiscover(BluetoothDevice device) async {
+    try {
+      _logger.info('偵錯：正在連線到裝置：${device.advName}...');
+      await device.connect();
+      _connectedDevice = device;
 
-      if (update.connectionState == DeviceConnectionState.connected) {
-        try {
-          final services = await _ble.discoverAllServices(update.deviceId);
-          for (var service in services) {
-            if (service.serviceId == _serviceUuid) {
-              for (var characteristic in service.characteristicIds) {
-                if (characteristic.characteristicId == _characteristicUuid) {
-                  print('偵錯: 找到目標服務和特徵。');
-                  break;
-                }
+      _connectionSubscription = device.connectionState.listen((state) async {
+        _logger.info('偵錯：連線狀態更新：$state');
+        if (state == BluetoothConnectionState.connected) {
+          setState(() => _isConnected = true);
+          _logger.info('偵錯：連線成功！正在尋找服務...');
+          await _discoverServices(device);
+        } else if (state == BluetoothConnectionState.disconnected) {
+          setState(() {
+            _isConnected = false;
+            _connectedDevice = null;
+            _writableCharacteristic = null;
+          });
+          _logger.info('偵錯：裝置已斷線。');
+          _connectionSubscription?.cancel();
+        }
+      });
+    } catch (e) {
+      _logger.severe('偵錯：連線發生錯誤：$e');
+      setState(() => _isConnected = false);
+    }
+  }
+
+  Future<void> _discoverServices(BluetoothDevice device) async {
+    try {
+      _logger.info('偵錯：尋找服務中...');
+      final services = await device.discoverServices();
+
+      for (var service in services) {
+        if (service.uuid == _serviceUuid) {
+          for (var characteristic in service.characteristics) {
+            if (characteristic.uuid == _characteristicUuid) {
+              _logger.info('偵錯：找到目標特徵值！');
+              _writableCharacteristic = characteristic;
+
+              if (_writableCharacteristic!.properties.write) {
+                _logger.info('偵錯：特徵值支援寫入。');
+              } else {
+                _logger.severe('偵錯：特徵值不支援寫入！');
+                _disconnect();
+                return;
               }
+              return;
             }
           }
-        } catch (e) {
-          print('偵錯: 尋找服務發生錯誤: $e');
         }
       }
-    }, onError: (Object error) {
-      print('偵錯: 連線發生錯誤: $error');
-      setState(() {
-        _isConnected = false;
-      });
+      _logger.warning('偵錯：未在裝置上找到指定的服務或特徵。');
+      _disconnect();
+    } catch (e) {
+      _logger.severe('偵錯：尋找服務發生錯誤：$e');
+      _disconnect();
+    }
+  }
+
+  Future<void> _disconnect() async {
+    if (_connectedDevice != null) {
+      try {
+        await _connectedDevice!.disconnect();
+        _logger.info('偵錯：已成功斷開連線。');
+      } catch (e) {
+        _logger.severe('偵錯：斷開連線失敗：$e');
+      }
+    }
+    setState(() {
+      _isConnected = false;
+      _connectedDevice = null;
+      _writableCharacteristic = null;
     });
+    _connectionSubscription?.cancel();
   }
 
   Future<void> _sendData(String data) async {
-    if (_isConnected && _connectedDeviceId != null) {
+    if (_writableCharacteristic != null) {
       try {
-        final characteristic = QualifiedCharacteristic(
-          serviceId: _serviceUuid,
-          characteristicId: _characteristicUuid,
-          deviceId: _connectedDeviceId!,
-        );
-        await _ble.writeCharacteristicWithResponse(characteristic, value: data.codeUnits);
-        print('資料發送成功: $data');
+        await _writableCharacteristic!.write(data.codeUnits, withoutResponse: false);
+        _logger.info('資料發送成功：$data');
+      } on PlatformException catch (e) {
+        _logger.severe('資料發送失敗 (PlatformException)：${e.code} - ${e.message}');
       } catch (e) {
-        print('資料發送失敗: $e');
+        _logger.severe('資料發送失敗：$e');
       }
     } else {
-      print('未連線到藍芽裝置。');
+      _logger.warning('偵錯：特徵值未就緒或未連線。');
     }
   }
 
@@ -177,16 +232,16 @@ class _GamepadScreenState extends State<GamepadScreen> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   ElevatedButton(
-                    onPressed: _connectToDevice,
+                    onPressed: _isConnected ? _disconnect : _connectToDevice,
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _isConnected ? Colors.green : Colors.blue,
+                      backgroundColor: _isConnected ? Colors.red : Colors.blue,
                       padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 15),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(10),
                       ),
                     ),
                     child: Text(
-                      _isConnected ? '已連線' : '藍芽連線',
+                      _isConnected ? '藍芽已連線' : '藍芽連線',
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 20,
@@ -214,7 +269,7 @@ class _GamepadScreenState extends State<GamepadScreen> {
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({Key? key}) : super(key: key);
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -233,13 +288,13 @@ class GamepadInterface extends StatelessWidget {
   final VoidCallback onButtonB;
 
   const GamepadInterface({
-    Key? key,
+    super.key,
     required this.onDpadLeft,
     required this.onDpadDown,
     required this.onDpadRight,
     required this.onButtonA,
     required this.onButtonB,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -273,12 +328,12 @@ class Dpad extends StatelessWidget {
   final VoidCallback onDpadRight;
 
   const Dpad({
-    Key? key,
+    super.key,
     required this.onDpadUp,
     required this.onDpadDown,
     required this.onDpadLeft,
     required this.onDpadRight,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -307,7 +362,7 @@ class Dpad extends StatelessWidget {
         shape: BoxShape.circle,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.3),
+            color: Colors.black.withAlpha((255 * 0.3).round()),
             spreadRadius: 1,
             blurRadius: 5,
             offset: const Offset(0, 3),
@@ -329,12 +384,12 @@ class ActionButtons extends StatelessWidget {
   final VoidCallback onButtonY;
 
   const ActionButtons({
-    Key? key,
+    super.key,
     required this.onButtonA,
     required this.onButtonB,
     required this.onButtonX,
     required this.onButtonY,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -368,7 +423,7 @@ class ActionButtons extends StatelessWidget {
         shape: BoxShape.circle,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.3),
+            color: Colors.black.withAlpha((255 * 0.3).round()),
             spreadRadius: 1,
             blurRadius: 5,
             offset: const Offset(0, 3),
@@ -392,7 +447,13 @@ class ActionButtons extends StatelessWidget {
     );
   }
 }
+
 void main() {
+  logging.Logger.root.level = logging.Level.ALL;
+  logging.Logger.root.onRecord.listen((record) {
+    debugPrint('${record.level.name}: ${record.message}');
+  });
+
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
